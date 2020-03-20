@@ -3,6 +3,9 @@ name = "gws-cache"
 version = "0.1.0"
 authors = ["Albert Gomà i León"]
 description = "Asynchronous cache for gws using Rust's port of SwissTable hash map."
+license = "GPL-2.0"
+repository = "https://github.com/AlbertGoma/gws-cache"
+readme = "README.md"
 edition = "2018"
 
 
