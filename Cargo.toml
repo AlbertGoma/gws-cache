@@ -10,4 +10,5 @@ edition = "2018"
 
 
 [dependencies]
-hashbrown = "0.7.1"
+hashbrown = { version = "0.7.1", features = ["raw"] }
+ahash = "0.3.2"
