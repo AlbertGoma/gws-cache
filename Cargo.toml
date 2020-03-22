@@ -12,3 +12,6 @@ edition = "2018"
 [dependencies]
 hashbrown = { version = "0.7.1", features = ["raw"] }
 ahash = "0.3.2"
+
+[dev-dependencies]
+futures = "0.3.4"
