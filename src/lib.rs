@@ -1,22 +1,18 @@
-use core::{
-  ptr::NonNull,
-  hash::{
-    BuildHasher,
-    Hash,
-    Hasher
-  },
-  mem,
-  fmt::Debug,
-  //marker::PhantomData
-};
+use core::{ptr::{self, NonNull}, hash::{BuildHasher, Hash, Hasher}, mem, fmt::Debug/*,marker::PhantomData*/};
 use ahash::RandomState;
 use hashbrown::raw::RawTable;
-use std::{sync::atomic::{AtomicBool, Ordering}, borrow::Borrow};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, borrow::Borrow};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-//TODO: use raw pointers to avoid multiple memory accesses.
+
+//FIXME: use raw pointers to avoid multiple memory accesses.
 type Link<K, V, M> = Option<NonNull<Node<K, V, M>>>;
 pub type DefaultHashBuilder = RandomState;
+
+pub trait Meta {
+  fn new() -> Self;
+  //fn update(&mut self);
+}
 
 pub enum Status<V> {
   Ok(V),                //->200
@@ -32,30 +28,32 @@ pub enum Status<V> {
 
 //TODO: V: ?Sized ????
 #[derive(Debug)]
-pub struct Node<K, V, M> {
-  k: K,
-  v: V,
-  m: Option<M>, //->Metadata
+pub struct Node<K, V, M: Meta> {
+  kv: Arc<(K, V)>,
+  m: M, //->Metadata
   p: Link<K, V, M>,
   n: Link<K, V, M>,
 }
 
 
-impl<K, V, M> Node<K, V, M> {
+
+/*impl<K, V> Node<K, V, Empty> {
+  #[inline]
   fn new(k: K, v: V) -> Self {
-    Self { k, v, m: None, p: None, n: None }
+    Self::with_meta(k, v, Empty())
   }
-  
-  fn with_metadata(k: K, v: V, m: M) -> Self {
-    Self { k, v, m: Some(m), p: None, n: None }
+}*/
+
+
+impl<K, V, M: Meta> Node<K, V, M> {
+  fn new(k: K, v: V, m: M) -> Self {
+    Self { kv: Arc::new((k, v)), m, p: None, n: None }
   }
 }
 
-//TODO: impl Drop for Node?
-
 /// An asynchronous LRU cache for [gws](https://github.com/AlbertGoma/gws)
 /// using [hashbrown](https://github.com/rust-lang/hashbrown).
-pub struct GWSCache<K, V, M, S = DefaultHashBuilder> { //FIXME: where K, V, Send/Sync??| Arc?
+pub struct GWSCache<K, V, M: Meta, S = DefaultHashBuilder> { //FIXME: where K, V, Send/Sync??
   pub(crate) hash_builder: S,
   pub(crate) table: RawTable<Node<K, V, M>>,
   pub(crate) head: Link<K, V, M>,
@@ -67,7 +65,7 @@ pub struct GWSCache<K, V, M, S = DefaultHashBuilder> { //FIXME: where K, V, Send
 
 
 
-impl<K, V, M> GWSCache<K, V, M, DefaultHashBuilder> {
+impl<K, V, M: Meta> GWSCache<K, V, M, DefaultHashBuilder> {
 
   // All the capacity must be preallocated: Otherwise the resize() function would slow down
   // accesses by copying all the nodes to a new table and fucking up all our pointers'
@@ -80,7 +78,7 @@ impl<K, V, M> GWSCache<K, V, M, DefaultHashBuilder> {
 
 
 
-impl<K, V, M, S> GWSCache<K, V, M, S> {
+impl<K, V, M: Meta, S> GWSCache<K, V, M, S> {
   pub fn with_hasher(capacity: usize, hash_builder: S) -> Self {
     Self {
       hash_builder,
@@ -123,30 +121,32 @@ impl<K, V, M, S> GWSCache<K, V, M, S>
 where
   K: Eq + Hash + Debug, 
   V: Debug,
-  M: Debug,
+  M: Debug + Meta,
   S: BuildHasher,
 {
 
   /// Inserts a key-value pair into the cache at the head of the list 
   /// and returns the old value if there is one.
-  pub async fn push_front(&mut self, k: K, v: V) -> Option<V> {
-    let ret: Option<V>;
+  pub async fn push_front(&mut self, k: K, v: V) -> Option<Arc<(K, V)>> {
+    let ret: Option<Arc<(K, V)>>;
     
     self.lock();
     let hash = make_hash(&self.hash_builder, &k);
     
       unsafe {
-        let ptr: *mut Node<K, V, M>;
+        let ptr: *mut Node<K, V, M>; //FIXME: adapt to metadata
 
         //TODO: increment self.bytes
         //FIXME: control RawTable capacity!!!!
 
         //Find in HashMap and replace value or insert new node:
-        if let Some(item) = self.table.find(hash, |x| k.eq(&x.k)) {
-          ret = Some(mem::replace(&mut item.as_mut().v, v));
+        if let Some(item) = self.table.find(hash, |x| k.eq(&x.kv.0)) {
+          //ret = Some(mem::replace(&mut item.as_mut().v, v));
+          ret = Some(mem::replace(&mut item.as_mut().kv, Arc::new((k, v))));
           ptr = item.as_ptr();
         } else {
-          ptr = self.table.insert_no_grow(hash, Node::new(k, v)).as_ptr();
+          //FIXME:set initial metadata when there is:
+          ptr = self.table.insert_no_grow(hash, Node::new(k, v, Meta::new())).as_ptr();
           ret = None;
         }
         
@@ -177,8 +177,8 @@ where
 
   /// Returns the key and value of the Least Frequently Used item in the
   /// cache unless it's empty.
-  pub async fn pop_back(&mut self) -> Option<(K, V)> {
-    let ret: Option<(K, V)>;
+  pub async fn pop_back(&mut self) -> Option<Arc<(K, V)>> {
+    let ret: Option<Arc<(K, V)>>;
 
     self.lock();
       if let Some(ptr) = self.tail {
@@ -191,9 +191,10 @@ where
             self.tail.unwrap().as_ptr(),
             self.tail.unwrap().as_ref());
 
-          //Extract from HashMap:
-          let hash = make_hash(&self.hash_builder, &ptr.as_ref().k);
-          if let Some(item) = self.table.find(hash, |x| ptr.as_ref().k.eq(&x.k)) {
+          //Find in HashMap:
+          let hash = make_hash(&self.hash_builder, &ptr.as_ref().kv.0);
+          if let Some(item) = self.table.find(hash, |x| ptr.as_ref().kv.0.eq(&x.kv.0)) {
+            ret = Some(ptr::read(&item.as_ref().kv as *const Arc<(K, V)>));
             self.table.erase_no_drop(&item);
 
             //Set new tail:
@@ -202,9 +203,7 @@ where
               None => self.head = None,
               Some(t) => (*t.as_ptr()).n = None,
             }
-            let node = item.read();
-            ret = Some((node.k, node.v));
-            //TODO: drop node?
+            
           } else {
             ret = None;
           }
@@ -217,27 +216,28 @@ where
     ret
   }
 
-  //FIXME: count references to V before drop! Make sure &V isn't dropped too soon!
-  pub async fn get/*<Q: ?Sized>*/(&mut self, k: K) -> Option<(K, &V)>
-  /*where
+
+  pub async fn get<Q: ?Sized>(&mut self, k: &Q) -> Option<Arc<(K, V)>>
+  where
     K: Borrow<Q>,
-    Q: Hash + Eq + Debug,*/
+    Q: Hash + Eq,
   {
-    let ret: Option<(K, &V)>;
-    let hash = make_hash(&self.hash_builder, &k);
+    let ret: Option<Arc<(K, V)>>;
+    let hash = make_hash(&self.hash_builder, k);
     let mut ptr: Link<K, V, M> = None;
     let mut prv: Link<K, V, M> = None;
     let mut nxt: Link<K, V, M> = None;
     
     self.lock();
       //Retrieve node from HashMap:
-      ret = self.table.find(hash, |x| k.eq(&x.k))
+      ret = self.table
+                .find(hash, |x| k.eq(&x.kv.0.borrow()))
                 .map(|item| unsafe {
-                  let Node{v, p, n, ..} = item.as_ref();
+                  let Node{kv, p, n, ..} = item.as_ref();
                   ptr = NonNull::new(item.as_ptr());
                   nxt = *n;
                   prv = *p;
-                  (k, v)
+                  Arc::clone(kv)
                 });
                 
       //Move node to head:
@@ -248,11 +248,11 @@ where
           unsafe {
             p.as_mut().n = Some(n);                   //Set previous' next to self.next
             n.as_mut().p = Some(p);                   //Set next's previous to self.previous
-            self.head.unwrap().as_mut().p = Some(t);  //Set old head's previous to self
-            t.as_mut().n = self.head.replace(t);      //Put in head and set self.next to old head
+            self.head.unwrap().as_mut().p = Some(t);  //Set old head node's previous to self
+            t.as_mut().n = self.head.replace(t);      //Put in head and set self.next to old head node
           }
         },
-        (Some(mut t), Some(mut p), None)=> {          //-> Node at the tail
+        (Some(mut t), Some(mut p), None) => {         //-> Node at the tail
           #[cfg(debug_assertions)]
           println!("Get tail node: {:?} (ptr={:?}, prv={:?}, nxt={:?})\n", &ret, ptr, prv, nxt);
           unsafe {
@@ -263,11 +263,11 @@ where
             t.as_mut().p = None;                      //Set new head's previous to None
           }
         },
-        _ =>{
+        _ => {                                        //-> Node nonexistent or already at head
           #[cfg(debug_assertions)]
           println!("Get head/single or nonexistent node: {:?} (ptr={:?}, prv={:?}, nxt={:?})\n", &ret, ptr, prv, nxt);
          ()
-        }                                             //-> Node nonexistent or already at head
+        }
       }
     self.unlock();
     ret
