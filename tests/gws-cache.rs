@@ -27,7 +27,6 @@ fn new_cache() {
 
 #[test]
 fn push_pop() {
-  //TODO: check tail's next and head's previous are always None!!
   type GWSC = GWSCache<u8, &'static str, TestMeta>;
   
   let mut c = GWSC::new(5);
@@ -38,14 +37,17 @@ fn push_pop() {
   block_on(c.push_front(4, "function"));
   
   //Replacing tail
-  block_on(c.push_front(1, "this")); //TODO: assert it's detected as tail
+  block_on(c.push_front(1, "this"));
   
   //Replacing middle
-  block_on(c.push_front(3, "a real")); //TODO: assert it's detected as middle
+  block_on(c.push_front(3, "a real"));
   block_on(c.push_front(4, "lkhsadgbflkhaf"));
   
   //Replacing head
-  block_on(c.push_front(4, "test?")); //TODO: assert it's detected as head
+  block_on(c.push_front(4, "test?"));
+  
+  //Checking head's previous and tail's next
+  c.assert_head_tail(None, None);
   
   assert_eq!(c.len(), 4);
 

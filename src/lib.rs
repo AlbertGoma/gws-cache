@@ -68,6 +68,14 @@ impl<K, V, M: Meta> GWSCache<K, V, M, DefaultHashBuilder> {
   pub fn new(capacity: usize) -> Self {
     Self::with_hasher(capacity, DefaultHashBuilder::default())
   }
+  
+  #[cfg(debug_assertions)]
+  pub fn assert_head_tail(&self, hp: Link<K, V, M>, tn: Link<K, V, M>) {
+    unsafe {
+      assert_eq!(self.head.unwrap().as_ref().p, hp);
+      assert_eq!(self.tail.unwrap().as_ref().n, tn);
+    }
+  }
 }
 
 
@@ -137,7 +145,7 @@ where
         t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
         t.as_mut().p = None;                      //Set new head's previous to None
       },
-      (Some(mut t), Some(mut p), None) => {           //-> Node at the tail
+      (Some(mut t), Some(mut p), None) => {           //-> Node at tail
         #[cfg(debug_assertions)]
         println!("Tail node:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
           t, t.as_ref(),
@@ -158,7 +166,7 @@ where
         self.head = Some(t);                      //Set self at head
         self.tail = Some(t);                      //Set self at tail
       },
-      (Some(mut t), None, None) => {                      //-> New node, elements in cache
+      (Some(mut t), None, None) => {                  //-> New node, elements in cache
         #[cfg(debug_assertions)]
         println!("New node, elements in cache:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
           t, t.as_ref(),
@@ -168,7 +176,7 @@ where
         self.head.unwrap().as_mut().p = Some(t);  //Set old head's previous to self
         t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
       },
-      _ => {                                          //-> Node nonexistent or already at head
+      _ => {                                          //-> Node already at head
         #[cfg(debug_assertions)]
         println!("Head node:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
           item.as_ptr(), item.as_ref(),
@@ -190,11 +198,11 @@ where
         p.as_mut().n = Some(n);                   //Set previous' next to next
         n.as_mut().p = Some(p);                   //Set next's previous to previous
       },
-      (Some(mut p), None) => {                        //-> Node at the tail
+      (Some(mut p), None) => {                        //-> Node at tail
         self.tail = Some(p);                      //Set tail to previous
         p.as_mut().n = None;                      //Set previous' next to None
       },
-      (None, Some(mut n)) => {                        //-> Node at the head
+      (None, Some(mut n)) => {                        //-> Node at head
         self.head = Some(n);                      //Set head to next
         n.as_mut().p = None;                      //Set next's previous to None
       },
@@ -242,7 +250,8 @@ where
 
 
   /// Inserts a key-value pair into the cache at the head of the list 
-  /// and returns the old value if there is one.
+  /// and returns the old value if there is one. Removes the least used
+  /// element if there is not enough space left.
   pub async fn push_front(&mut self, k: K, v: V) -> Option<Arc<(K, V)>> {
     let ret: (Bucket<Node<K, V, M>>, Option<Arc<(K, V)>>);
     
@@ -250,7 +259,7 @@ where
     //FIXME: adapt to metadata
     
     self.lock();
-      if self.len() == self.capacity() {
+      /*while */if self.len() >= self.capacity() /* || self.bytes_left < input_size*/ {
         self.tail
             .and_then(|p| unsafe {
               self.find(&p.as_ref().kv.0, self.h(&p.as_ref().kv.0))
