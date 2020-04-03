@@ -1,22 +1,10 @@
-use gws_cache::{GWSCache, DefaultHashBuilder, Meta};
+use gws_cache::{GWSCache, DefaultHashBuilder};
 use futures::executor::block_on;
-use tokio::runtime;
-
-#[derive(Debug)]
-struct TestMeta();
-
-impl Meta for TestMeta {
-  fn new() -> Self {
-    Self()
-  }
-}
-
-
 
 
 #[test]
 fn new_cache() {
-  type GWSC = GWSCache<u64, i64, TestMeta>;
+  type GWSC = GWSCache<u64, i64>;
 
   let t = GWSC::new(0);
   assert_eq!(t.capacity(), 0);
@@ -27,7 +15,7 @@ fn new_cache() {
 
 #[test]
 fn push_pop() {
-  type GWSC = GWSCache<u8, &'static str, TestMeta>;
+  type GWSC = GWSCache<u8, &'static str>;
   
   let mut c = GWSC::new(5);
   block_on(c.push_front(1, "This"));
@@ -60,7 +48,7 @@ fn push_pop() {
 
 #[test]
 fn get() {
-  type KV = GWSCache<&'static str, &'static str, TestMeta>;
+  type KV = GWSCache<&'static str, &'static str>;
   
   let mut c = KV::new(5);
   block_on(c.push_front("a", "first"));
@@ -92,24 +80,14 @@ fn get() {
 
 #[test]
 fn capacity() {
-  type KV = GWSCache<u8, u8, TestMeta>;
+  type KV = GWSCache<u8, u8>;
   let mut c = KV::new(5);
-  //let pool = ThreadPool::new().unwrap();
-  //let rt = runtime::Builder::new().threaded_scheduler().build().unwrap();
   
   for i in 0..20 {
-    //rt.spawn(c.push_front(i, i % 7));
     block_on(c.push_front(i, i % 7));
-    
   }
 
-  for i in 0..20 {
-    println!("{:?}", /*rt.*/block_on(c.pop_back()));
+  for _ in 0..20 {
+    println!("{:?}", block_on(c.pop_back()));
   }
 }
-
-//TODO: test concurrent access to linkedlist!
-
-//TODO: test concurrent reads to node
-
-//TODO: test metadata
