@@ -1,6 +1,6 @@
 use core::{ptr::{self, NonNull}, hash::{BuildHasher, Hash, Hasher}, mem, fmt::Debug/*,marker::PhantomData*/};
 use ahash::RandomState;
-use hashbrown::raw::RawTable;
+use hashbrown::raw::{RawTable, Bucket};
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, borrow::Borrow};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -26,6 +26,8 @@ pub enum Status<V> {
   Error,                //->500 Don't Panic!
 }
 
+
+
 //TODO: V: ?Sized ????
 #[derive(Debug)]
 pub struct Node<K, V, M: Meta> {
@@ -35,21 +37,13 @@ pub struct Node<K, V, M: Meta> {
   n: Link<K, V, M>,
 }
 
-
-
-/*impl<K, V> Node<K, V, Empty> {
-  #[inline]
-  fn new(k: K, v: V) -> Self {
-    Self::with_meta(k, v, Empty())
-  }
-}*/
-
-
 impl<K, V, M: Meta> Node<K, V, M> {
   fn new(k: K, v: V, m: M) -> Self {
     Self { kv: Arc::new((k, v)), m, p: None, n: None }
   }
 }
+
+
 
 /// An asynchronous LRU cache for [gws](https://github.com/AlbertGoma/gws)
 /// using [hashbrown](https://github.com/rust-lang/hashbrown).
@@ -124,54 +118,152 @@ where
   M: Debug + Meta,
   S: BuildHasher,
 {
+  //self.lock must be true to be used safely
+  #[inline]
+  unsafe fn to_head(&mut self, item: Bucket<Node<K, V, M>>) -> Bucket<Node<K, V, M>> {
+    let tpn = (NonNull::new(item.as_ptr()), item.as_ref().p, item.as_ref().n);
+    
+    match tpn {
+      (Some(mut t), Some(mut p), Some(mut n)) => {    //-> Node in the middle
+        #[cfg(debug_assertions)]
+        println!("Middle node:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
+          t, t.as_ref(),
+          self.head, self.head.unwrap().as_ref(),
+          self.tail, self.tail.unwrap().as_ref());
+        
+        p.as_mut().n = Some(n);                   //Set previous' next to self.next
+        n.as_mut().p = Some(p);                   //Set next's previous to self.previous
+        self.head.unwrap().as_mut().p = Some(t);  //Set old head node's previous to self
+        t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
+        t.as_mut().p = None;                      //Set new head's previous to None
+      },
+      (Some(mut t), Some(mut p), None) => {           //-> Node at the tail
+        #[cfg(debug_assertions)]
+        println!("Tail node:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
+          t, t.as_ref(),
+          self.head, self.head.unwrap().as_ref(),
+          self.tail, self.tail.unwrap().as_ref());
+        
+        p.as_mut().n = None;                      //Set new tail node's next to None
+        self.tail.replace(p);                     //Set new tail
+        self.head.unwrap().as_mut().p = Some(t);  //Set old head's previous to self
+        t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
+        t.as_mut().p = None;                      //Set new head's previous to None
+      },
+      (Some(t), None, None) if self.tail == None => { //-> New node, empty cache
+        #[cfg(debug_assertions)]
+        println!("New node, empty cache:\n({:?})\t{:?}\nHead: {:?}\nTail: {:?}\n",
+          t, t.as_ref(), self.head, self.tail);
+        
+        self.head = Some(t);                      //Set self at head
+        self.tail = Some(t);                      //Set self at tail
+      },
+      (Some(mut t), None, None) => {                      //-> New node, elements in cache
+        #[cfg(debug_assertions)]
+        println!("New node, elements in cache:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
+          t, t.as_ref(),
+          self.head, self.head.unwrap().as_ref(),
+          self.tail, self.tail.unwrap().as_ref());
+        
+        self.head.unwrap().as_mut().p = Some(t);  //Set old head's previous to self
+        t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
+      },
+      _ => {                                          //-> Node nonexistent or already at head
+        #[cfg(debug_assertions)]
+        println!("Head node:\n({:?})\t{:?}\nHead: {:?}\t{:?}\nTail: {:?}\t{:?}\n",
+          item.as_ptr(), item.as_ref(),
+          self.head, self.head.unwrap().as_ref(),
+          self.tail, self.tail.unwrap().as_ref());
+        ()
+      }
+    }
+    item
+  }
+
+  //self.lock must be true to be used safely
+  #[inline]
+  unsafe fn remove(&mut self, item: Bucket<Node<K, V, M>>) -> Option<Bucket<Node<K, V, M>>> {
+    let pn = (item.as_ref().p, item.as_ref().n);
+    
+    match pn {
+      (Some(mut p), Some(mut n)) => {                 //-> Node in the middle
+        p.as_mut().n = Some(n);                   //Set previous' next to next
+        n.as_mut().p = Some(p);                   //Set next's previous to previous
+      },
+      (Some(mut p), None) => {                        //-> Node at the tail
+        self.tail = Some(p);                      //Set tail to previous
+        p.as_mut().n = None;                      //Set previous' next to None
+      },
+      (None, Some(mut n)) => {                        //-> Node at the head
+        self.head = Some(n);                      //Set head to next
+        n.as_mut().p = None;                      //Set next's previous to None
+      },
+      _ => {                                          //-> Last node in cache (both at head and tail)
+        self.tail = None;
+        self.head = None;
+      }
+    }
+    
+    self.table.erase_no_drop(&item);
+    None
+  }
+  
+  //self.lock must be true and capacity must be handled to be used safely
+  #[inline]
+  unsafe fn upsert(&mut self, k: K, v: V, m: M) -> (Bucket<Node<K, V, M>>, Option<Arc<(K, V)>>) {
+    let h = self.h(&k);
+    match self.find(&k, h) {
+      Some(i) => {
+        let kv = mem::replace(&mut i.as_mut().kv, Arc::new((k, v)));
+        (i, Some(kv))
+      },
+      None => (self.table.insert_no_grow(h, Node::new(k, v, m)), None),
+    }
+  }
+  
+  //self.lock must be true to be used safely, otherwise it could return a bucket about to be erased.
+  #[inline]
+  unsafe fn find<Q: ?Sized>(&self, k: &Q, h: u64) -> Option<Bucket<Node<K, V, M>>>
+  where
+    K: Borrow<Q>,
+    Q: Eq,
+  {
+    self.table.find(h, |x| k.eq(&x.kv.0.borrow()))
+  }
+
+  #[inline]
+  fn h<Q: Hash + ?Sized>(&self, k: &Q) -> u64 {
+    let mut state = self.hash_builder.build_hasher();
+    k.hash(&mut state);
+    state.finish()
+  }
+
+
+
 
   /// Inserts a key-value pair into the cache at the head of the list 
   /// and returns the old value if there is one.
   pub async fn push_front(&mut self, k: K, v: V) -> Option<Arc<(K, V)>> {
-    let ret: Option<Arc<(K, V)>>;
+    let ret: (Bucket<Node<K, V, M>>, Option<Arc<(K, V)>>);
+    
+    //TODO: increment self.bytes
+    //FIXME: adapt to metadata
     
     self.lock();
-    let hash = make_hash(&self.hash_builder, &k);
-    
-      unsafe {
-        let ptr: *mut Node<K, V, M>; //FIXME: adapt to metadata
-
-        //TODO: increment self.bytes
-        //FIXME: control RawTable capacity!!!!
-
-        //Find in HashMap and replace value or insert new node:
-        if let Some(item) = self.table.find(hash, |x| k.eq(&x.kv.0)) {
-          //ret = Some(mem::replace(&mut item.as_mut().v, v));
-          ret = Some(mem::replace(&mut item.as_mut().kv, Arc::new((k, v))));
-          ptr = item.as_ptr();
-        } else {
-          //FIXME:set initial metadata when there is:
-          ptr = self.table.insert_no_grow(hash, Node::new(k, v, Meta::new())).as_ptr();
-          ret = None;
-        }
-        
-        //Move node to head:
-        if let Some(mut head) = self.head {  //-> One or more entries in cache
-          if head.as_ptr() != ptr {          //-> Node not alredy in head
-            (&mut *ptr).n = self.head;
-            head.as_mut().p = NonNull::new(ptr);
-            self.head = NonNull::new(ptr);
-          }
-        } else {                             //-> Cache is empty
-          self.head = NonNull::new(ptr);
-          self.tail = NonNull::new(ptr);
-        }
-        
-        #[cfg(debug_assertions)]
-        println!("Push Front:\nHead=({:?})\t{:?}\nTail=({:?})\t{:?}\n",
-          self.head.unwrap().as_ptr(),
-          self.head.unwrap().as_ref(),
-          self.tail.unwrap().as_ptr(),
-          self.tail.unwrap().as_ref());
+      if self.len() == self.capacity() {
+        self.tail
+            .and_then(|p| unsafe {
+              self.find(&p.as_ref().kv.0, self.h(&p.as_ref().kv.0))
+            }).and_then(|i| unsafe {
+              self.remove(i)
+            });
       }
-
+      unsafe {
+        ret = self.upsert(k, v, Meta::new());
+        self.to_head(ret.0);
+      }
     self.unlock();
-    ret
+    ret.1
   }
 
 
@@ -180,38 +272,15 @@ where
   pub async fn pop_back(&mut self) -> Option<Arc<(K, V)>> {
     let ret: Option<Arc<(K, V)>>;
 
-    self.lock();
-      if let Some(ptr) = self.tail {
-        unsafe {
-
-          #[cfg(debug_assertions)]
-          println!("Pop Back:\nHead=({:?})\t{:?}\nTail=({:?})\t{:?}\n",
-            self.head.unwrap().as_ptr(),
-            self.head.unwrap().as_ref(),
-            self.tail.unwrap().as_ptr(),
-            self.tail.unwrap().as_ref());
-
-          //Find in HashMap:
-          let hash = make_hash(&self.hash_builder, &ptr.as_ref().kv.0);
-          if let Some(item) = self.table.find(hash, |x| ptr.as_ref().kv.0.eq(&x.kv.0)) {
-            ret = Some(ptr::read(&item.as_ref().kv as *const Arc<(K, V)>));
-            self.table.erase_no_drop(&item);
-
-            //Set new tail:
-            self.tail = ptr.as_ref().p;
-            match self.tail {
-              None => self.head = None,
-              Some(t) => (*t.as_ptr()).n = None,
-            }
-            
-          } else {
-            ret = None;
-          }
-        }
-      } else {
-        ret = None;
-      }
-
+    self.lock();      
+      ret = self.tail
+                .and_then(|p| unsafe {
+                  self.find(&p.as_ref().kv.0, self.h(&p.as_ref().kv.0))
+                }).map(|i| unsafe {
+                  let ret = ptr::read(&i.as_ref().kv as *const Arc<(K, V)>);
+                  self.remove(i);
+                  ret
+                });
     self.unlock();
     ret
   }
@@ -223,51 +292,14 @@ where
     Q: Hash + Eq,
   {
     let ret: Option<Arc<(K, V)>>;
-    let hash = make_hash(&self.hash_builder, k);
-    let mut ptr: Link<K, V, M> = None;
-    let mut prv: Link<K, V, M> = None;
-    let mut nxt: Link<K, V, M> = None;
-    
+
     self.lock();
-      //Retrieve node from HashMap:
-      ret = self.table
-                .find(hash, |x| k.eq(&x.kv.0.borrow()))
-                .map(|item| unsafe {
-                  let Node{kv, p, n, ..} = item.as_ref();
-                  ptr = NonNull::new(item.as_ptr());
-                  nxt = *n;
-                  prv = *p;
-                  Arc::clone(kv)
-                });
-                
-      //Move node to head:
-      match (ptr, prv, nxt) {
-        (Some(mut t), Some(mut p), Some(mut n)) => {  //-> Node in the middle
-          #[cfg(debug_assertions)]
-          println!("Get middle node: {:?} (ptr={:?}, prv={:?}, nxt={:?})\n", &ret, ptr, prv, nxt);
-          unsafe {
-            p.as_mut().n = Some(n);                   //Set previous' next to self.next
-            n.as_mut().p = Some(p);                   //Set next's previous to self.previous
-            self.head.unwrap().as_mut().p = Some(t);  //Set old head node's previous to self
-            t.as_mut().n = self.head.replace(t);      //Put in head and set self.next to old head node
-          }
-        },
-        (Some(mut t), Some(mut p), None) => {         //-> Node at the tail
-          #[cfg(debug_assertions)]
-          println!("Get tail node: {:?} (ptr={:?}, prv={:?}, nxt={:?})\n", &ret, ptr, prv, nxt);
-          unsafe {
-            p.as_mut().n = None;                      //Set new tail node's next to None
-            self.tail.replace(p);                     //Set new tail
-            self.head.unwrap().as_mut().p = Some(t);  //Set old head's previous to self
-            t.as_mut().n = self.head.replace(t);      //Set self at head with next pointing to old head
-            t.as_mut().p = None;                      //Set new head's previous to None
-          }
-        },
-        _ => {                                        //-> Node nonexistent or already at head
-          #[cfg(debug_assertions)]
-          println!("Get head/single or nonexistent node: {:?} (ptr={:?}, prv={:?}, nxt={:?})\n", &ret, ptr, prv, nxt);
-         ()
-        }
+      unsafe {
+        ret = self.find(k, self.h(&k))
+                  .map(|i| {
+                    let Node{kv, ..} = self.to_head(i).as_ref();
+                    Arc::clone(kv)
+                  });
       }
     self.unlock();
     ret
@@ -284,19 +316,7 @@ where
   
   /*pub fn get_range() -> Result<V, E> {
   }*/
-  //TODO: move_front
-
-  //TODO: pub get
 }
-
-
-pub(crate) fn make_hash<K: Hash + ?Sized>(hash_builder: &impl BuildHasher, val: &K) -> u64 {
-  let mut state = hash_builder.build_hasher();
-  val.hash(&mut state);
-  state.finish()
-}
-
-//TODO: impl Drop for GWSCache?
 
 //TODO: impl Sync for GWSCache
 

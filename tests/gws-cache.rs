@@ -27,6 +27,7 @@ fn new_cache() {
 
 #[test]
 fn push_pop() {
+  //TODO: check tail's next and head's previous are always None!!
   type GWSC = GWSCache<u8, &'static str, TestMeta>;
   
   let mut c = GWSC::new(5);
@@ -35,13 +36,23 @@ fn push_pop() {
   assert_eq!(c.len(), 2);
   block_on(c.push_front(3, "a"));
   block_on(c.push_front(4, "function"));
-  block_on(c.push_front(4, "test"));
+  
+  //Replacing tail
+  block_on(c.push_front(1, "this")); //TODO: assert it's detected as tail
+  
+  //Replacing middle
+  block_on(c.push_front(3, "a real")); //TODO: assert it's detected as middle
+  block_on(c.push_front(4, "lkhsadgbflkhaf"));
+  
+  //Replacing head
+  block_on(c.push_front(4, "test?")); //TODO: assert it's detected as head
+  
   assert_eq!(c.len(), 4);
 
-  assert_eq!(*block_on(c.pop_back()).unwrap(), (1, "This"));
   assert_eq!(*block_on(c.pop_back()).unwrap(), (2, "is"));
-  assert_eq!(*block_on(c.pop_back()).unwrap(), (3, "a"));
-  assert_eq!(*block_on(c.pop_back()).unwrap(), (4, "test"));
+  assert_eq!(*block_on(c.pop_back()).unwrap(), (1, "this"));
+  assert_eq!(*block_on(c.pop_back()).unwrap(), (3, "a real"));
+  assert_eq!(*block_on(c.pop_back()).unwrap(), (4, "test?"));
   assert_eq!(block_on(c.pop_back()), None);
 }
 
