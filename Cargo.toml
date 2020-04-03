@@ -10,4 +10,10 @@ edition = "2018"
 
 
 [dependencies]
-hashbrown = "0.7.1"
+hashbrown = { version = "0.7.1", features = ["raw", "rustc-internal-api", "inline-more"] }
+ahash = "0.3.2"
+tokio = { version = "0.2.13", features = ["io-util", "parking_lot"] }
+
+[dev-dependencies]
+futures = "0.3.4"
+tokio = { version = "0.2.13", features = ["rt-threaded", "macros", "test-util"] }
