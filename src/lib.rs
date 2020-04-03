@@ -250,8 +250,8 @@ where
 
 
   /// Inserts a key-value pair into the cache at the head of the list 
-  /// and returns the old value if there is one. Removes the least used
-  /// element if there is not enough space left.
+  /// and returns the old value if there is one. Removes the Least 
+  /// Frequently Used element if there is not enough space left.
   pub async fn push_front(&mut self, k: K, v: V) -> Option<Arc<(K, V)>> {
     let ret: (Bucket<Node<K, V, M>>, Option<Arc<(K, V)>>);
     
@@ -294,7 +294,9 @@ where
     ret
   }
 
-
+  /// Returns the key and value of the element that corresponds to the
+  /// provided key when it exists. This key-value pair then gets placed
+  /// at the head of the cache's list.
   pub async fn get<Q: ?Sized>(&mut self, k: &Q) -> Option<Arc<(K, V)>>
   where
     K: Borrow<Q>,
