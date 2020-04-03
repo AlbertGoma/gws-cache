@@ -111,5 +111,3 @@ fn capacity() {
 //TODO: test concurrent reads to node
 
 //TODO: test metadata
-
-//TODO: test overflow capacity!
